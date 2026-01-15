@@ -87,9 +87,9 @@ def execute_roll(sid, room_id, held_indices):
     room = rooms.get(room_id)
     if not room or not room['game_active']: return
     
-    # Validar turno (si viene del timer, sid es correcto por definición, pero validamos igual)
+    # Validar turno
     if room['players'][room['current_turn_index']]['id'] != sid: return
-    if room['rolls_left'] <= 0: return # Si intenta tirar sin tiros, forzamos pass? No, solo retornamos.
+    if room['rolls_left'] <= 0: return
 
     new_dice = []
     for i in range(5):
@@ -150,7 +150,7 @@ def execute_pass(sid, room_id):
 def resolve_game_over(room, room_id):
     results = []
     for p in room['players']:
-        p['is_ready'] = False 
+        p['is_ready'] = False # Aquí los marcamos como NO listos para la siguiente ronda
         if not p['final_hand']:
             p['final_hand'] = [random.choice(CARAS_DADOS) for _ in range(5)]
         eval_res = get_hand_score(p['final_hand'])
@@ -171,7 +171,6 @@ def resolve_game_over(room, room_id):
         'results': results,
         'winner_name': winner_name
     }, room=room_id)
-    # No reiniciamos timer aquí porque el juego acabó
 
 # --- EVENTOS SOCKET.IO ---
 
@@ -206,16 +205,12 @@ def disconnect(sid):
             sio.emit('update_room', room['players'], room=room_id)
 
             if room['game_active']:
-                # Si se va alguien en medio del juego, invalidamos el timer actual
-                # (Aunque la lógica de start_turn_timer ya maneja ids nuevos)
-                
                 if player_index < room['current_turn_index']:
                     room['current_turn_index'] -= 1
                 elif player_index == room['current_turn_index']:
                     if room['current_turn_index'] >= len(room['players']):
                         resolve_game_over(room, room_id)
                     else:
-                        # Reseteamos estado para el siguiente
                         room['dice'] = ['?', '?', '?', '?', '?']
                         room['rolls_left'] = room['config']['max_rolls']
                         room['held_indices'] = []
@@ -226,7 +221,6 @@ def disconnect(sid):
                             'last_player_name': f"{player_removed['name']} (Salió)",
                             'rolls_left': room['rolls_left']
                         }, room=room_id)
-                        # Iniciamos timer para el nuevo jugador
                         start_turn_timer(room_id)
             break
 
@@ -247,7 +241,7 @@ def create_room(sid, data):
         'dice': ['?', '?', '?', '?', '?'],
         'rolls_left': max_rolls,
         'held_indices': [],
-        'action_id': 0 # Para controlar timers obsoletos
+        'action_id': 0
     }
     sio.emit('room_joined', {'room_id': room_id, 'is_host': True, 'config': rooms[room_id]['config']}, room=sid)
     sio.emit('update_room', rooms[room_id]['players'], room=room_id)
@@ -263,7 +257,8 @@ def join_room(sid, data):
         sio.emit('error', {'message': 'El juego ya comenzó'}, room=sid)
         return
     sio.enter_room(sid, room_id)
-    rooms[room_id]['players'].append({'id': sid, 'name': username, 'final_hand': [], 'is_ready': False})
+    # CORRECCIÓN: is_ready = True para que jueguen la primera partida
+    rooms[room_id]['players'].append({'id': sid, 'name': username, 'final_hand': [], 'is_ready': True})
     sio.emit('room_joined', {'room_id': room_id, 'is_host': False, 'config': rooms[room_id]['config']}, room=sid)
     sio.emit('update_room', rooms[room_id]['players'], room=room_id)
 
@@ -314,17 +309,14 @@ def start_game(sid, room_id):
             'rolls_left': room['rolls_left']
         }, room=room_id)
         
-        # INICIAR TIMER PRIMER TURNO
         start_turn_timer(room_id)
 
 @sio.event
 def roll_dice(sid, data):
-    # Wrapper simple para el evento
     execute_roll(sid, data['room_id'], data.get('held_indices', []))
 
 @sio.event
 def pass_turn(sid, room_id):
-    # Wrapper simple para el evento
     execute_pass(sid, room_id)
 
 if __name__ == '__main__':
