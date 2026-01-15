@@ -22,14 +22,13 @@ def get_hand_score(dice):
     nums = sorted([VALORES[d] for d in dice], reverse=True)
     counts = Counter(nums)
     # Ordenar por frecuencia (cuántos repetidos) y luego por valor
-    # Ejemplo: Full de K y 9 -> ((3, 13), (2, 9))
     sorted_counts = sorted(counts.items(), key=lambda x: (x[1], x[0]), reverse=True)
     
-    shape = [c[1] for c in sorted_counts] # Estructura (ej: [3, 2] es Full)
-    vals = [c[0] for c in sorted_counts]  # Valores de las cartas
+    shape = [c[1] for c in sorted_counts] 
+    vals = [c[0] for c in sorted_counts]  
     
     hand_name = "Nada"
-    score_type = 0 # 0=Nada, 1=Par, ..., 5=Quintilla
+    score_type = 0 
 
     if shape == [5]:
         score_type = 7; hand_name = "Quintilla (Grande)"
@@ -46,8 +45,6 @@ def get_hand_score(dice):
     else:
         score_type = 1; hand_name = "Carta Alta"
 
-    # Retornamos una tupla score_tuple para comparar fácilmente en Python
-    # (Tipo de mano, valor principal, valor secundario...)
     return {
         'score_tuple': (score_type, vals),
         'name': hand_name,
@@ -133,6 +130,7 @@ def start_game(sid, room_id):
 
         sio.emit('game_started', {
             'current_turn': room['players'][0]['id'],
+            'current_player_name': room['players'][0]['name'], # Enviamos el nombre
             'dice': room['dice'],
             'rolls_left': room['rolls_left']
         }, room=room_id)
@@ -170,17 +168,15 @@ def pass_turn(sid, room_id):
     room = rooms.get(room_id)
     if not room or room['players'][room['current_turn_index']]['id'] != sid: return
 
-    # 1. Guardar la mano final del jugador actual
-    # Si el jugador nunca tiró (pasó directo), generamos una mano aleatoria o tomamos lo que haya
+    # 1. Guardar mano final
     current_hand = room['dice']
-    if '?' in current_hand: # Si pasó sin tirar nunca, generamos mano random (opcional)
+    if '?' in current_hand: 
          current_hand = [random.choice(CARAS_DADOS) for _ in range(5)]
 
     room['players'][room['current_turn_index']]['final_hand'] = current_hand
 
-    # 2. Verificar si era el ÚLTIMO jugador
+    # 2. Verificar fin del juego
     if room['current_turn_index'] >= len(room['players']) - 1:
-        # --- FIN DEL JUEGO ---
         results = []
         for p in room['players']:
             eval_res = get_hand_score(p['final_hand'])
@@ -192,7 +188,6 @@ def pass_turn(sid, room_id):
                 'score': eval_res['score_tuple']
             })
         
-        # Ordenar resultados: Mayor score gana
         results.sort(key=lambda x: x['score'], reverse=True)
         winner = results[0]
 
@@ -213,6 +208,7 @@ def pass_turn(sid, room_id):
 
         sio.emit('turn_change', {
             'current_turn': room['players'][next_idx]['id'],
+            'current_player_name': room['players'][next_idx]['name'], # Enviamos el nombre
             'last_player_name': room['players'][room['current_turn_index']-1]['name'],
             'rolls_left': room['rolls_left']
         }, room=room_id)
