@@ -53,7 +53,6 @@ def resolve_game_over(room, room_id):
     """Función auxiliar para finalizar el juego y anunciar ganador."""
     results = []
     for p in room['players']:
-        # Si un jugador no alcanzó a jugar (ej. desconexión masiva), generamos mano random
         if not p['final_hand']:
             p['final_hand'] = [random.choice(CARAS_DADOS) for _ in range(5)]
             
@@ -66,7 +65,6 @@ def resolve_game_over(room, room_id):
             'score': eval_res['score_tuple']
         })
     
-    # Ordenar por puntaje
     results.sort(key=lambda x: x['score'], reverse=True)
     winner_name = results[0]['name'] if results else "Nadie"
 
@@ -83,12 +81,10 @@ def connect(sid, environ):
 @sio.event
 def disconnect(sid):
     print(f'Cliente desconectado: {sid}')
-    # Iteramos sobre una copia de las llaves para poder borrar salas si es necesario
     for room_id in list(rooms.keys()):
         room = rooms.get(room_id)
         if not room: continue
 
-        # Buscar al jugador y su índice
         player_index = -1
         player_removed = None
         for i, p in enumerate(room['players']):
@@ -98,38 +94,25 @@ def disconnect(sid):
                 break
         
         if player_removed:
-            # Eliminar jugador
             room['players'].pop(player_index)
             
-            # 1. Si la sala queda vacía, borrarla
             if not room['players']:
                 del rooms[room_id]
                 break
 
-            # 2. Migración de Anfitrión: Si se fue el índice 0, el nuevo índice 0 es el host
             if player_index == 0:
                 new_host = room['players'][0]
                 sio.emit('host_promoted', {'is_host': True}, room=new_host['id'])
 
-            # Notificar lista actualizada
             sio.emit('update_room', room['players'], room=room_id)
 
-            # 3. Manejo de desconexión en JUEGO ACTIVO
             if room['game_active']:
-                # Ajustar índice de turno si el jugador borrado estaba antes
                 if player_index < room['current_turn_index']:
                     room['current_turn_index'] -= 1
-                
-                # Si el jugador que se fue ERA el del turno actual
                 elif player_index == room['current_turn_index']:
-                    # Si ya no quedan jugadores suficientes (ej. quedó solo 1), se podría acabar
-                    # Pero seguiremos la lógica de pasar turno o terminar ronda
-                    
-                    # Verificar si se acabó la ronda (era el último o nos pasamos)
                     if room['current_turn_index'] >= len(room['players']):
                         resolve_game_over(room, room_id)
                     else:
-                        # Pasar turno al siguiente (que ahora ocupa este mismo índice)
                         room['dice'] = ['?', '?', '?', '?', '?']
                         room['rolls_left'] = room['config']['max_rolls']
                         room['held_indices'] = []
@@ -140,6 +123,7 @@ def disconnect(sid):
                             'current_player_name': next_p['name'],
                             'last_player_name': f"{player_removed['name']} (Salió)",
                             'rolls_left': room['rolls_left']
+                            # Nota: No enviamos mano aquí porque se desconectó
                         }, room=room_id)
             break
 
@@ -188,7 +172,6 @@ def join_room(sid, data):
 
 @sio.event
 def start_game(sid, room_id):
-    # Verificamos que sea el jugador 0 (host)
     if room_id in rooms and rooms[room_id]['players'][0]['id'] == sid:
         room = rooms[room_id]
         room['game_active'] = True
@@ -245,10 +228,15 @@ def pass_turn(sid, room_id):
 
     room['players'][room['current_turn_index']]['final_hand'] = current_hand
 
-    # Verificar fin del juego (si es el último jugador)
+    # Verificar fin del juego
     if room['current_turn_index'] >= len(room['players']) - 1:
         resolve_game_over(room, room_id)
     else:
+        # Calcular mano del jugador que acaba de terminar para enviarla al historial
+        last_player_idx = room['current_turn_index']
+        last_player_hand = room['players'][last_player_idx]['final_hand']
+        last_hand_eval = get_hand_score(last_player_hand)
+
         # Siguiente turno
         next_idx = room['current_turn_index'] + 1
         room['current_turn_index'] = next_idx
@@ -260,7 +248,9 @@ def pass_turn(sid, room_id):
         sio.emit('turn_change', {
             'current_turn': room['players'][next_idx]['id'],
             'current_player_name': room['players'][next_idx]['name'],
-            'last_player_name': room['players'][room['current_turn_index']-1]['name'],
+            'last_player_name': room['players'][next_idx-1]['name'],
+            'last_player_hand': last_player_hand, # DADOS DEL JUGADOR ANTERIOR
+            'last_player_desc': last_hand_eval['description'], # QUÉ SACÓ (Ej: Tercia de K)
             'rolls_left': room['rolls_left']
         }, room=room_id)
 
