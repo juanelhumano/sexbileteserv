@@ -1,20 +1,63 @@
 import socketio
 import eventlet
 import random
+from collections import Counter
 
-# Crear servidor Socket.IO permitiendo conexiones desde cualquier sitio (CORS)
+# Crear servidor Socket.IO
 sio = socketio.Server(cors_allowed_origins='*')
 app = socketio.WSGIApp(sio)
 
-# Almacenamiento en memoria (diccionario de salas)
-# Estructura: rooms[room_id] = { players: [], config: {}, game_state: {} }
 rooms = {}
 
-# Actualizado con 10 de Corazones y 9 de Picas
+# Valores para calcular el ganador (mayor valor gana en empate de mano)
 CARAS_DADOS = ['A', 'K', 'Q', 'J', '10♥', '9♠']
+VALORES = {'A': 14, 'K': 13, 'Q': 12, 'J': 11, '10♥': 10, '9♠': 9}
 
 def get_initial_dice():
     return [random.choice(CARAS_DADOS) for _ in range(5)]
+
+def get_hand_score(dice):
+    """Calcula el valor de la mano para determinar el ganador."""
+    # Convertir símbolos a valores numéricos
+    nums = sorted([VALORES[d] for d in dice], reverse=True)
+    counts = Counter(nums)
+    # Ordenar por frecuencia (cuántos repetidos) y luego por valor
+    # Ejemplo: Full de K y 9 -> ((3, 13), (2, 9))
+    sorted_counts = sorted(counts.items(), key=lambda x: (x[1], x[0]), reverse=True)
+    
+    shape = [c[1] for c in sorted_counts] # Estructura (ej: [3, 2] es Full)
+    vals = [c[0] for c in sorted_counts]  # Valores de las cartas
+    
+    hand_name = "Nada"
+    score_type = 0 # 0=Nada, 1=Par, ..., 5=Quintilla
+
+    if shape == [5]:
+        score_type = 7; hand_name = "Quintilla (Grande)"
+    elif shape == [4, 1]:
+        score_type = 6; hand_name = "Poker"
+    elif shape == [3, 2]:
+        score_type = 5; hand_name = "Full House"
+    elif shape == [3, 1, 1]:
+        score_type = 4; hand_name = "Tercia"
+    elif shape == [2, 2, 1]:
+        score_type = 3; hand_name = "Dos Pares"
+    elif shape == [2, 1, 1, 1]:
+        score_type = 2; hand_name = "Par"
+    else:
+        score_type = 1; hand_name = "Carta Alta"
+
+    # Retornamos una tupla score_tuple para comparar fácilmente en Python
+    # (Tipo de mano, valor principal, valor secundario...)
+    return {
+        'score_tuple': (score_type, vals),
+        'name': hand_name,
+        'description': f"{hand_name} de {get_key_from_value(vals[0])}"
+    }
+
+def get_key_from_value(val):
+    for k, v in VALORES.items():
+        if v == val: return k
+    return str(val)
 
 @sio.event
 def connect(sid, environ):
@@ -23,21 +66,20 @@ def connect(sid, environ):
 @sio.event
 def disconnect(sid):
     print(f'Cliente desconectado: {sid}')
-    # Buscar en qué sala estaba y eliminarlo
     for room_id, room in rooms.items():
         for player in room['players']:
             if player['id'] == sid:
                 room['players'].remove(player)
                 sio.emit('update_room', room['players'], room=room_id)
                 if len(room['players']) == 0:
-                    del rooms[room_id] # Borrar sala si está vacía
+                    del rooms[room_id]
                 break
 
 @sio.event
 def create_room(sid, data):
     room_id = data['room_id']
     username = data['username']
-    max_rolls = int(data.get('max_rolls', 3)) # Configuración de tiradas
+    max_rolls = int(data.get('max_rolls', 3))
 
     if room_id in rooms:
         sio.emit('error', {'message': 'La sala ya existe'}, room=sid)
@@ -45,13 +87,13 @@ def create_room(sid, data):
 
     sio.enter_room(sid, room_id)
     rooms[room_id] = {
-        'players': [{'id': sid, 'name': username, 'score': 0}],
+        'players': [{'id': sid, 'name': username, 'final_hand': []}],
         'config': {'max_rolls': max_rolls},
         'game_active': False,
         'current_turn_index': 0,
         'dice': ['?', '?', '?', '?', '?'],
         'rolls_left': max_rolls,
-        'held_indices': [] # Índices de dados guardados
+        'held_indices': []
     }
     
     sio.emit('room_joined', {'room_id': room_id, 'is_host': True, 'config': rooms[room_id]['config']}, room=sid)
@@ -71,7 +113,7 @@ def join_room(sid, data):
         return
 
     sio.enter_room(sid, room_id)
-    rooms[room_id]['players'].append({'id': sid, 'name': username, 'score': 0})
+    rooms[room_id]['players'].append({'id': sid, 'name': username, 'final_hand': []})
     
     sio.emit('room_joined', {'room_id': room_id, 'is_host': False, 'config': rooms[room_id]['config']}, room=sid)
     sio.emit('update_room', rooms[room_id]['players'], room=room_id)
@@ -86,7 +128,9 @@ def start_game(sid, room_id):
         room['rolls_left'] = room['config']['max_rolls']
         room['held_indices'] = []
         
-        # Notificar a todos que el juego empieza
+        # Limpiar manos anteriores
+        for p in room['players']: p['final_hand'] = []
+
         sio.emit('game_started', {
             'current_turn': room['players'][0]['id'],
             'dice': room['dice'],
@@ -96,22 +140,20 @@ def start_game(sid, room_id):
 @sio.event
 def roll_dice(sid, data):
     room_id = data['room_id']
-    held_indices = data.get('held_indices', []) # Lista de índices [0, 2, 4]
+    held_indices = data.get('held_indices', [])
     
     room = rooms.get(room_id)
     
-    # Validaciones
     if not room or not room['game_active']: return
     if room['players'][room['current_turn_index']]['id'] != sid: return
     if room['rolls_left'] <= 0: return
 
-    # Lógica de tirada
     new_dice = []
     for i in range(5):
         if i in held_indices and room['dice'][i] != '?':
-            new_dice.append(room['dice'][i]) # Mantener dado
+            new_dice.append(room['dice'][i])
         else:
-            new_dice.append(random.choice(CARAS_DADOS)) # Tirar nuevo
+            new_dice.append(random.choice(CARAS_DADOS))
 
     room['dice'] = new_dice
     room['rolls_left'] -= 1
@@ -128,20 +170,52 @@ def pass_turn(sid, room_id):
     room = rooms.get(room_id)
     if not room or room['players'][room['current_turn_index']]['id'] != sid: return
 
-    # Siguiente turno
-    next_idx = (room['current_turn_index'] + 1) % len(room['players'])
-    room['current_turn_index'] = next_idx
-    
-    # Resetear estado para el siguiente jugador
-    room['dice'] = ['?', '?', '?', '?', '?']
-    room['rolls_left'] = room['config']['max_rolls']
-    room['held_indices'] = []
+    # 1. Guardar la mano final del jugador actual
+    # Si el jugador nunca tiró (pasó directo), generamos una mano aleatoria o tomamos lo que haya
+    current_hand = room['dice']
+    if '?' in current_hand: # Si pasó sin tirar nunca, generamos mano random (opcional)
+         current_hand = [random.choice(CARAS_DADOS) for _ in range(5)]
 
-    sio.emit('turn_change', {
-        'current_turn': room['players'][next_idx]['id'],
-        'last_player_name': room['players'][room['current_turn_index']-1]['name'], # Nombre del que terminó
-        'rolls_left': room['rolls_left']
-    }, room=room_id)
+    room['players'][room['current_turn_index']]['final_hand'] = current_hand
+
+    # 2. Verificar si era el ÚLTIMO jugador
+    if room['current_turn_index'] >= len(room['players']) - 1:
+        # --- FIN DEL JUEGO ---
+        results = []
+        for p in room['players']:
+            eval_res = get_hand_score(p['final_hand'])
+            results.append({
+                'name': p['name'],
+                'dice': p['final_hand'],
+                'hand_name': eval_res['name'],
+                'desc': eval_res['description'],
+                'score': eval_res['score_tuple']
+            })
+        
+        # Ordenar resultados: Mayor score gana
+        results.sort(key=lambda x: x['score'], reverse=True)
+        winner = results[0]
+
+        room['game_active'] = False
+        sio.emit('game_over', {
+            'results': results,
+            'winner_name': winner['name']
+        }, room=room_id)
+
+    else:
+        # --- SIGUIENTE TURNO ---
+        next_idx = room['current_turn_index'] + 1
+        room['current_turn_index'] = next_idx
+        
+        room['dice'] = ['?', '?', '?', '?', '?']
+        room['rolls_left'] = room['config']['max_rolls']
+        room['held_indices'] = []
+
+        sio.emit('turn_change', {
+            'current_turn': room['players'][next_idx]['id'],
+            'last_player_name': room['players'][room['current_turn_index']-1]['name'],
+            'rolls_left': room['rolls_left']
+        }, room=room_id)
 
 if __name__ == '__main__':
     eventlet.wsgi.server(eventlet.listen(('', 5000)), app)
