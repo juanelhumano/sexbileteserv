@@ -9,7 +9,6 @@ app = socketio.WSGIApp(sio)
 
 rooms = {}
 
-# Valores para calcular el ganador
 CARAS_DADOS = ['A', 'K', 'Q', 'J', '10♥', '9♠']
 VALORES = {'A': 14, 'K': 13, 'Q': 12, 'J': 11, '10♥': 10, '9♠': 9}
 
@@ -17,19 +16,15 @@ def get_initial_dice():
     return [random.choice(CARAS_DADOS) for _ in range(5)]
 
 def get_hand_score(dice):
-    """Calcula el valor de la mano."""
     if not dice: return {'score_tuple': (0, []), 'name': 'Nada', 'description': 'Sin jugada'}
-    
     nums = sorted([VALORES[d] for d in dice], reverse=True)
     counts = Counter(nums)
     sorted_counts = sorted(counts.items(), key=lambda x: (x[1], x[0]), reverse=True)
-    
     shape = [c[1] for c in sorted_counts] 
     vals = [c[0] for c in sorted_counts]  
     
     hand_name = "Nada"
     score_type = 0 
-
     if shape == [5]: score_type = 7; hand_name = "Quintilla (Grande)"
     elif shape == [4, 1]: score_type = 6; hand_name = "Poker"
     elif shape == [3, 2]: score_type = 5; hand_name = "Full House"
@@ -50,14 +45,16 @@ def get_key_from_value(val):
     return str(val)
 
 def resolve_game_over(room, room_id):
-    """Función auxiliar para finalizar el juego y anunciar ganador."""
     results = []
+    # Reseteamos estado de "listo" para la siguiente ronda
     for p in room['players']:
+        p['is_ready'] = False # Nadie está listo al terminar, deben confirmar
+        
         if not p['final_hand']:
             p['final_hand'] = [random.choice(CARAS_DADOS) for _ in range(5)]
-            
         eval_res = get_hand_score(p['final_hand'])
         results.append({
+            'id': p['id'], # Enviamos ID para identificar quién es quién en el front
             'name': p['name'],
             'dice': p['final_hand'],
             'hand_name': eval_res['name'],
@@ -95,11 +92,9 @@ def disconnect(sid):
         
         if player_removed:
             room['players'].pop(player_index)
-            
             if not room['players']:
                 del rooms[room_id]
                 break
-
             if player_index == 0:
                 new_host = room['players'][0]
                 sio.emit('host_promoted', {'is_host': True}, room=new_host['id'])
@@ -116,14 +111,12 @@ def disconnect(sid):
                         room['dice'] = ['?', '?', '?', '?', '?']
                         room['rolls_left'] = room['config']['max_rolls']
                         room['held_indices'] = []
-                        
                         next_p = room['players'][room['current_turn_index']]
                         sio.emit('turn_change', {
                             'current_turn': next_p['id'],
                             'current_player_name': next_p['name'],
                             'last_player_name': f"{player_removed['name']} (Salió)",
                             'rolls_left': room['rolls_left']
-                            # Nota: No enviamos mano aquí porque se desconectó
                         }, room=room_id)
             break
 
@@ -132,14 +125,12 @@ def create_room(sid, data):
     room_id = data['room_id']
     username = data['username']
     max_rolls = int(data.get('max_rolls', 3))
-
     if room_id in rooms:
         sio.emit('error', {'message': 'La sala ya existe'}, room=sid)
         return
-
     sio.enter_room(sid, room_id)
     rooms[room_id] = {
-        'players': [{'id': sid, 'name': username, 'final_hand': []}],
+        'players': [{'id': sid, 'name': username, 'final_hand': [], 'is_ready': True}], # Host nace listo
         'config': {'max_rolls': max_rolls},
         'game_active': False,
         'current_turn_index': 0,
@@ -147,7 +138,6 @@ def create_room(sid, data):
         'rolls_left': max_rolls,
         'held_indices': []
     }
-    
     sio.emit('room_joined', {'room_id': room_id, 'is_host': True, 'config': rooms[room_id]['config']}, room=sid)
     sio.emit('update_room', rooms[room_id]['players'], room=room_id)
 
@@ -155,32 +145,68 @@ def create_room(sid, data):
 def join_room(sid, data):
     room_id = data['room_id']
     username = data['username']
-
     if room_id not in rooms:
         sio.emit('error', {'message': 'La sala no existe'}, room=sid)
         return
-    
     if rooms[room_id]['game_active']:
         sio.emit('error', {'message': 'El juego ya comenzó'}, room=sid)
         return
-
     sio.enter_room(sid, room_id)
-    rooms[room_id]['players'].append({'id': sid, 'name': username, 'final_hand': []})
-    
+    rooms[room_id]['players'].append({'id': sid, 'name': username, 'final_hand': [], 'is_ready': False})
     sio.emit('room_joined', {'room_id': room_id, 'is_host': False, 'config': rooms[room_id]['config']}, room=sid)
     sio.emit('update_room', rooms[room_id]['players'], room=room_id)
+
+@sio.event
+def player_ready(sid, room_id):
+    room = rooms.get(room_id)
+    if not room: return
+    for p in room['players']:
+        if p['id'] == sid:
+            p['is_ready'] = True
+            # Notificar a todos que este jugador está listo (reusamos update_room o un evento especifico)
+            # Para simplificar, mandamos un evento especifico de estado
+            sio.emit('player_status_update', {'player_id': sid, 'is_ready': True}, room=room_id)
+            break
 
 @sio.event
 def start_game(sid, room_id):
     if room_id in rooms and rooms[room_id]['players'][0]['id'] == sid:
         room = rooms[room_id]
+        
+        # --- FILTRADO DE JUGADORES ---
+        # Solo se quedan el Host (siempre seguro) y los que tengan is_ready=True
+        active_players = []
+        players_to_remove = []
+
+        for p in room['players']:
+            # El host (índice 0 o matching sid) siempre juega, los demás deben estar listos
+            if p['id'] == sid or p.get('is_ready', False):
+                active_players.append(p)
+            else:
+                players_to_remove.append(p)
+        
+        # Notificar a los eliminados
+        for p in players_to_remove:
+            sio.emit('kicked_inactive', room=p['id']) # Evento personal
+            sio.leave_room(p['id'], room_id) # Sacarlos del socket room
+
+        # Actualizar la lista oficial de la sala
+        room['players'] = active_players
+        
+        # Si por alguna razón se queda solo el host, igual iniciamos (o se podría validar >1)
+        
         room['game_active'] = True
         room['current_turn_index'] = 0
         room['dice'] = ['?', '?', '?', '?', '?']
         room['rolls_left'] = room['config']['max_rolls']
         room['held_indices'] = []
         
-        for p in room['players']: p['final_hand'] = []
+        for p in room['players']: 
+            p['final_hand'] = []
+            p['is_ready'] = False # Resetear para la proxima
+
+        # Actualizamos la lista visual de todos (ya sin los eliminados)
+        sio.emit('update_room', room['players'], room=room_id)
 
         sio.emit('game_started', {
             'current_turn': room['players'][0]['id'],
@@ -194,7 +220,6 @@ def roll_dice(sid, data):
     room_id = data['room_id']
     held_indices = data.get('held_indices', [])
     room = rooms.get(room_id)
-    
     if not room or not room['game_active']: return
     if room['players'][room['current_turn_index']]['id'] != sid: return
     if room['rolls_left'] <= 0: return
@@ -221,23 +246,18 @@ def pass_turn(sid, room_id):
     room = rooms.get(room_id)
     if not room or room['players'][room['current_turn_index']]['id'] != sid: return
 
-    # Guardar mano final
     current_hand = room['dice']
     if '?' in current_hand: 
          current_hand = [random.choice(CARAS_DADOS) for _ in range(5)]
-
     room['players'][room['current_turn_index']]['final_hand'] = current_hand
 
-    # Verificar fin del juego
     if room['current_turn_index'] >= len(room['players']) - 1:
         resolve_game_over(room, room_id)
     else:
-        # Calcular mano del jugador que acaba de terminar para enviarla al historial
         last_player_idx = room['current_turn_index']
         last_player_hand = room['players'][last_player_idx]['final_hand']
         last_hand_eval = get_hand_score(last_player_hand)
 
-        # Siguiente turno
         next_idx = room['current_turn_index'] + 1
         room['current_turn_index'] = next_idx
         
@@ -249,8 +269,8 @@ def pass_turn(sid, room_id):
             'current_turn': room['players'][next_idx]['id'],
             'current_player_name': room['players'][next_idx]['name'],
             'last_player_name': room['players'][next_idx-1]['name'],
-            'last_player_hand': last_player_hand, # DADOS DEL JUGADOR ANTERIOR
-            'last_player_desc': last_hand_eval['description'], # QUÉ SACÓ (Ej: Tercia de K)
+            'last_player_hand': last_player_hand, 
+            'last_player_desc': last_hand_eval['description'],
             'rolls_left': room['rolls_left']
         }, room=room_id)
 
